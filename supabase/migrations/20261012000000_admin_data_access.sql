@@ -25,7 +25,7 @@ DECLARE
   table_name text;
 BEGIN
   FOREACH table_name IN ARRAY ARRAY[
-    'orders', 'investments', 'verification_records', 'account_restrictions',
+    'transactions', 'orders', 'investments', 'verification_records', 'account_restrictions',
     'security_events', 'referrals', 'wallet_connections', 'support_tickets',
     'balances', 'notifications'
   ] LOOP

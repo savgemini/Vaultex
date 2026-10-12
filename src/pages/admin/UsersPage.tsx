@@ -23,7 +23,7 @@ export default function AdminUsersPage() {
   useEffect(() => {
     const loadUsers = async () => {
       const [profileResult, balanceResult, assetResult] = await Promise.all([
-        supabase.from('profiles').select('id, full_name, email, country, verification_level, account_status, created_at').order('created_at', { ascending: false }),
+        supabase.from('profiles').select('id, full_name, email, country, verification_level, account_status, created_at').eq('is_demo', false).order('created_at', { ascending: false }),
         supabase.from('balances').select('user_id, asset_id, available, invested, pending'),
         supabase.from('assets').select('id, current_price'),
       ]);

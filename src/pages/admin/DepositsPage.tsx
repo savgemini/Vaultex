@@ -34,6 +34,12 @@ interface TransactionRow {
   } | null;
 }
 
+interface DepositProfile {
+  id: string;
+  full_name: string;
+  is_demo: boolean;
+}
+
 export default function AdminDepositsPage() {
   const { toast } = useToast();
   const [tab, setTab] = useState('all');
@@ -41,6 +47,7 @@ export default function AdminDepositsPage() {
   const [selected, setSelected] = useState<Deposit | null>(null);
   const [deposits, setDeposits] = useState<Deposit[]>([]);
   const [loading, setLoading] = useState(true);
+  const [reviewingId, setReviewingId] = useState<string | null>(null);
 
   const loadDeposits = async () => {
     setLoading(true);
@@ -58,26 +65,29 @@ export default function AdminDepositsPage() {
     }
 
     const userIds = Array.from(new Set((transactionRows || []).map((r: TransactionRow) => r.user_id).filter(Boolean)));
-    const profileMap = new Map<string, string>();
+    const profileMap = new Map<string, DepositProfile>();
 
     if (userIds.length) {
       const { data: profiles, error: profileError } = await supabase
         .from('profiles')
-        .select('id, full_name')
+        .select('id, full_name, is_demo')
         .in('id', userIds);
 
       if (profileError) {
-        toast('Deposit records loaded, but user names could not be joined.', 'error');
+        toast('Could not verify which deposit rows belong to demo accounts.', 'error');
+        setLoading(false);
+        return;
       }
 
-      (profiles || []).forEach((profile: { id: string; full_name: string }) => {
-        profileMap.set(profile.id, profile.full_name || 'Unknown user');
+      (profiles || []).forEach((profile: DepositProfile) => {
+        profileMap.set(profile.id, profile);
       });
     }
 
-    const rows: Deposit[] = (transactionRows || []).map((row: TransactionRow) => ({
+    const realTransactionRows = (transactionRows || []).filter((row: TransactionRow) => !profileMap.get(row.user_id)?.is_demo);
+    const rows: Deposit[] = realTransactionRows.map((row: TransactionRow) => ({
       id: row.id,
-      user: profileMap.get(row.user_id) || 'Unknown user',
+      user: profileMap.get(row.user_id)?.full_name || 'Unknown user',
       asset: row.asset_symbol || 'N/A',
       amount: Number(row.amount) || 0,
       method: typeof row.details?.method === 'string' ? row.details.method : 'Crypto Transfer',
@@ -95,79 +105,54 @@ export default function AdminDepositsPage() {
   }, []);
 
   const updateStatus = async (id: string, status: string) => {
-    const { data: deposit, error: depositError } = await supabase
+    if (reviewingId) return;
+    setReviewingId(id);
+    const { error } = await supabase.rpc('admin_review_deposit', {
+      p_transaction_id: id,
+      p_status: status,
+    });
+
+    if (error) {
+      const migrationHint = error.message.includes('admin_review_deposit') || error.message.includes('function')
+        ? ' Apply the deposit approval SQL migration in Supabase first.'
+        : '';
+      toast(`Failed to review deposit: ${error.message}.${migrationHint}`, 'error');
+      setReviewingId(null);
+      return;
+    }
+
+    const savedStatus = ['completed', 'confirmed', 'approved'].includes(status) ? 'completed' : status;
+    const { data: persistedDeposit, error: verifyError } = await supabase
       .from('transactions')
-      .select('id, user_id, asset_id, asset_symbol, amount, status')
+      .select('status')
       .eq('id', id)
       .eq('type', 'deposit')
       .maybeSingle();
 
-    if (depositError || !deposit) {
-      toast('Failed to load the deposit transaction before review.', 'error');
+    if (verifyError || !persistedDeposit || persistedDeposit.status !== savedStatus) {
+      toast(
+        verifyError
+          ? `Review request ran, but the saved status could not be verified: ${verifyError.message}`
+          : `Review request ran, but the database status is ${persistedDeposit?.status || 'missing'} instead of ${savedStatus}.`,
+        'error'
+      );
+      setReviewingId(null);
       return;
     }
 
-    const { error } = await supabase
-      .from('transactions')
-      .update({ status, updated_at: new Date().toISOString() })
-      .eq('id', id)
-      .eq('type', 'deposit');
-
-    if (error) {
-      toast(`Failed to update deposit status: ${error.message}`, 'error');
-      return;
+    setDeposits(current => current.map(deposit => deposit.id === id ? { ...deposit, status: savedStatus } : deposit));
+    setSelected(current => current?.id === id ? { ...current, status: savedStatus } : current);
+    if (tab !== 'all' && tab !== savedStatus) {
+      setTab('all');
+      setPage(1);
     }
-
-    if (['completed', 'confirmed', 'approved'].includes(status)) {
-      let assetId = deposit.asset_id;
-
-      if (!assetId) {
-        const { data: assetRow, error: assetError } = await supabase
-          .from('assets')
-          .select('id')
-          .eq('symbol', deposit.asset_symbol)
-          .maybeSingle();
-
-        if (!assetError && assetRow) {
-          assetId = assetRow.id;
-        }
-      }
-
-      if (assetId) {
-        const { data: existingBalance, error: balanceReadError } = await supabase
-          .from('balances')
-          .select('*')
-          .eq('user_id', deposit.user_id)
-          .eq('asset_id', assetId)
-          .maybeSingle();
-
-        if (!balanceReadError && existingBalance) {
-          await supabase
-            .from('balances')
-            .update({
-              available: Number(existingBalance.available) + Number(deposit.amount),
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', existingBalance.id);
-        } else {
-          await supabase.from('balances').insert({
-            user_id: deposit.user_id,
-            asset_id: assetId,
-            available: Number(deposit.amount),
-            invested: 0,
-            pending: 0,
-            avg_acquisition_price: 0,
-            updated_at: new Date().toISOString(),
-          });
-        }
-      }
-    }
-
-    toast(`Deposit status set to ${status}.`, 'success');
+    toast(status === 'completed' ? 'Deposit approved and credited to the user balance.' : `Deposit status set to ${status}.`, 'success');
     await loadDeposits();
+    setReviewingId(null);
   };
 
   const filtered = tab === 'all' ? deposits : deposits.filter(d => d.status === tab);
+  const pageRows = filtered.slice((page - 1) * 10, page * 10);
 
   return (
     <div>
@@ -195,20 +180,20 @@ export default function AdminDepositsPage() {
             <Dropdown trigger={<button className="p-1.5 hover:bg-surface-100 rounded text-sm">Review</button>}>
               <DropdownItem onClick={() => setSelected(d)}>View Details</DropdownItem>
               <DropdownSeparator />
-              <DropdownItem onClick={() => updateStatus(d.id, 'completed')}>Approve</DropdownItem>
+              <DropdownItem onClick={() => updateStatus(d.id, 'completed')}>{reviewingId === d.id ? 'Saving...' : 'Approve'}</DropdownItem>
               <DropdownItem onClick={() => updateStatus(d.id, 'under_review')}>Mark Under Review</DropdownItem>
               <DropdownSeparator />
               <DropdownItem variant="danger" onClick={() => updateStatus(d.id, 'rejected')}>Reject</DropdownItem>
             </Dropdown>
           ) },
         ]}
-        data={filtered}
+        data={pageRows}
         loading={loading}
         rowKey={(d) => d.id}
         emptyState={<EmptyState title="No deposits found" description="No deposits match your current filter." />}
       />
 
-      <Pagination page={page} totalPages={Math.ceil(filtered.length / 10)} onPageChange={setPage} />
+      <Pagination page={page} totalPages={Math.max(1, Math.ceil(filtered.length / 10))} onPageChange={setPage} />
 
       <Modal open={!!selected} onClose={() => setSelected(null)} title="Deposit Details" size="md">
         {selected && (
